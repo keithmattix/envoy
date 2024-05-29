@@ -295,7 +295,7 @@ TEST_F(SotwSubscriptionStateTest, AckGenerated) {
   {
     EXPECT_CALL(*ttl_timer_, disableTimer());
     UpdateAck ack = deliverBadDiscoveryResponse("version3", "nonce3");
-    EXPECT_EQ("nonce3", ack.nonce_);
+    wEXPECT_EQ("nonce3", ack.nonce_);
     EXPECT_NE(Grpc::Status::WellKnownGrpcStatus::Ok, ack.error_detail_.code());
   }
   // The last response successfully updates all 3.

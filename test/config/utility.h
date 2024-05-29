@@ -228,6 +228,8 @@ public:
                const envoy::config::cluster::v3::Cluster::LbPolicy lb_policy =
                    envoy::config::cluster::v3::Cluster::ROUND_ROBIN);
 
+  static envoy::config::cluster::v3::Cluster buildInvalidCluster(const std::string& name);
+
   static envoy::config::cluster::v3::Cluster
   buildTlsCluster(const std::string& name,
                   const envoy::config::cluster::v3::Cluster::LbPolicy lb_policy =

@@ -579,6 +579,28 @@ TEST_P(AdsIntegrationTest, ResourceNamesOnStreamReset) {
   sendDiscoveryResponse<envoy::config::listener::v3::Listener>(Config::TypeUrl::get().Listener, {},
                                                                {}, {}, "1");
 
+  // Send an invalid CDS response to make sure we get a NACK
+  sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
+      Config::TypeUrl::get().Cluster, {buildInvalidCluster("cluster_0")},
+      {buildInvalidCluster("cluster_0")}, {}, "1");
+
+  // CDS is going to ask for endpoints again.
+  EXPECT_TRUE(
+      compareDiscoveryRequest(Config::TypeUrl::get().ClusterLoadAssignment, "1", {}, {}, {}));
+  // Send the endpoints
+  sendDiscoveryResponse<envoy::config::endpoint::v3::ClusterLoadAssignment>(
+      Config::TypeUrl::get().ClusterLoadAssignment, {buildClusterLoadAssignment("cluster_0")},
+      {buildClusterLoadAssignment("cluster_0")}, {}, "1");
+
+  // The LDS request, which returns no resources in the DiscoveryResponse.
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "", {}, {}, {}));
+  sendDiscoveryResponse<envoy::config::listener::v3::Listener>(Config::TypeUrl::get().Listener, {},
+                                                               {}, {}, "1");
+  // Expect a NACK
+  EXPECT_TRUE(compareDiscoveryRequest(
+      Config::TypeUrl::get().Cluster, "1", {}, {}, {}, false,
+      Grpc::Status::WellKnownGrpcStatus::Internal,
+      "Error adding/updating cluster(s) cluster_0: The table size of maglev must be prime number"));
   xds_stream_->finishGrpcStream(Grpc::Status::Internal);
   AssertionResult result = xds_connection_->waitForNewStream(*dispatcher_, xds_stream_);
   RELEASE_ASSERT(result, result.message());

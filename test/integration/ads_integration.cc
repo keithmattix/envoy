@@ -53,6 +53,11 @@ AdsIntegrationTest::buildCluster(const std::string& name,
   return ConfigHelper::buildCluster(name, lb_policy);
 }
 
+envoy::config::cluster::v3::Cluster
+AdsIntegrationTest::buildInvalidCluster(const std::string& name) {
+  return ConfigHelper::buildInvalidCluster(name);
+}
+
 envoy::config::cluster::v3::Cluster AdsIntegrationTest::buildTlsCluster(const std::string& name) {
   return ConfigHelper::buildTlsCluster(name, envoy::config::cluster::v3::Cluster::ROUND_ROBIN);
 }

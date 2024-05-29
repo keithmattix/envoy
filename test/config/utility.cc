@@ -567,6 +567,29 @@ ConfigHelper::buildCluster(const std::string& name,
   return cluster;
 }
 
+envoy::config::cluster::v3::Cluster ConfigHelper::buildInvalidCluster(const std::string& name) {
+
+  envoy::config::cluster::v3::Cluster cluster;
+  cluster.mutable_connect_timeout()->set_seconds(5);
+  cluster.set_type(envoy::config::cluster::v3::Cluster::EDS);
+  cluster.set_name(name);
+  cluster.set_lb_policy(envoy::config::cluster::v3::Cluster::MAGLEV);
+  // Set table size-to non-prime to make it invalid.
+  cluster.mutable_maglev_lb_config()->mutable_table_size()->set_value(500);
+
+  auto* eds = cluster.mutable_eds_cluster_config()->mutable_eds_config();
+  eds->set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
+  eds->mutable_ads();
+
+  envoy::extensions::upstreams::http::v3::HttpProtocolOptions protocol_options;
+  protocol_options.mutable_explicit_http_config()->mutable_http2_protocol_options();
+  (*cluster.mutable_typed_extension_protocol_options())
+      ["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]
+          .PackFrom(protocol_options);
+
+  return cluster;
+}
+
 envoy::config::cluster::v3::Cluster
 ConfigHelper::buildTlsCluster(const std::string& name,
                               const envoy::config::cluster::v3::Cluster::LbPolicy lb_policy) {
