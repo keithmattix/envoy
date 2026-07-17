@@ -4,6 +4,7 @@
 #include "envoy/config/endpoint/v3/endpoint_components.pb.h"
 #include "envoy/extensions/clusters/dns/v3/dns_cluster.pb.h"
 #include "envoy/extensions/clusters/dns/v3/dns_cluster.pb.validate.h"
+#include "envoy/thread_local/thread_local.h"
 
 #include "source/common/upstream/cluster_factory_impl.h"
 #include "source/common/upstream/upstream_impl.h"
@@ -40,6 +41,20 @@ public:
          const envoy::extensions::clusters::dns::v3::DnsCluster& dns_cluster,
          ClusterFactoryContext& context, Network::DnsResolverSharedPtr dns_resolver);
 
+  class LoadBalancer;
+
+  class ThreadAwareLoadBalancer : public Upstream::ThreadAwareLoadBalancer {
+  public:
+    ThreadAwareLoadBalancer(std::weak_ptr<DnsClusterImpl> cluster) : cluster_(std::move(cluster)) {}
+
+    // Upstream::ThreadAwareLoadBalancer
+    Upstream::LoadBalancerFactorySharedPtr factory() override;
+    absl::Status initialize() override { return absl::OkStatus(); }
+
+  private:
+    std::weak_ptr<DnsClusterImpl> cluster_;
+  };
+
 protected:
   DnsClusterImpl(const envoy::config::cluster::v3::Cluster& cluster,
                  const envoy::extensions::clusters::dns::v3::DnsCluster& dns_cluster,
@@ -47,6 +62,9 @@ protected:
                  absl::Status& creation_status);
 
 private:
+  class ThreadLocalState;
+  class OnDemandHostSelectionHandle;
+
   struct ResolveTarget {
     ResolveTarget(DnsClusterImpl& parent, Event::Dispatcher& dispatcher,
                   const std::string& dns_address, const uint32_t dns_port,
@@ -100,6 +118,9 @@ private:
 
   void updateAllHosts(const HostVector& hosts_added, const HostVector& hosts_removed,
                       uint32_t priority);
+  void startOnDemandResolve();
+  void onDemandResolveTargetComplete(std::string details);
+  void notifyPendingOnDemandHostSelections(std::string details);
 
   // ClusterImplBase
   void startPreInit() override;
@@ -112,7 +133,10 @@ private:
   // resolve_targets_ outlives them.
   const envoy::config::endpoint::v3::ClusterLoadAssignment load_assignment_;
   const LocalInfo::LocalInfo& local_info_;
+  Event::Dispatcher& main_thread_dispatcher_;
+  TimeSource& time_source_;
   Network::DnsResolverSharedPtr dns_resolver_;
+  ThreadLocal::TypedSlot<ThreadLocalState> tls_slot_;
   std::list<ResolveTargetPtr> resolve_targets_;
   const std::chrono::milliseconds dns_refresh_rate_ms_;
   const std::chrono::milliseconds dns_min_refresh_rate_ms_;
@@ -123,6 +147,10 @@ private:
   uint32_t overprovisioning_factor_;
   bool weighted_priority_health_;
   bool all_addresses_in_single_endpoint_;
+  bool on_demand_;
+  bool on_demand_resolve_in_progress_{};
+  uint64_t pending_on_demand_resolve_targets_{};
+  std::string on_demand_resolve_details_;
 };
 
 DECLARE_FACTORY(DnsClusterFactory);

@@ -17,6 +17,7 @@
 #include "source/extensions/clusters/common/dns_cluster_backcompat.h"
 #include "source/extensions/clusters/dns/dns_cluster.h"
 #include "source/extensions/clusters/logical_dns/logical_dns_cluster.h"
+#include "source/extensions/load_balancing_policies/cluster_provided/config.h"
 #include "source/server/transport_socket_config_impl.h"
 
 #include "test/common/upstream/utility.h"
@@ -26,6 +27,8 @@
 #include "test/mocks/server/admin.h"
 #include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/upstream/cluster_manager.h"
+#include "test/mocks/upstream/load_balancer_context.h"
+#include "test/test_common/registry.h"
 #include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
@@ -127,6 +130,27 @@ protected:
       server_context_.dispatcher_.createTimer([]() -> void {});
     }
     return status_or_cluster.status();
+  }
+
+  absl::StatusOr<std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr>>
+  createDnsExtensionClusterFromV3Yaml(const std::string& yaml) {
+    ON_CALL(server_context_, api()).WillByDefault(ReturnRef(*api_));
+    envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
+    ClusterFactoryContextImpl::LazyCreateDnsResolver resolver_fn = [&]() { return dns_resolver_; };
+    Envoy::Upstream::ClusterFactoryContextImpl factory_context(server_context_, resolver_fn,
+                                                               nullptr, false);
+
+    ProtobufTypes::MessagePtr dns_cluster_msg =
+        std::make_unique<envoy::extensions::clusters::dns::v3::DnsCluster>();
+    RETURN_IF_NOT_OK(Config::Utility::translateOpaqueConfig(
+        cluster_config.cluster_type().typed_config(), factory_context.messageValidationVisitor(),
+        *dns_cluster_msg));
+    const auto& dns_cluster =
+        MessageUtil::downcastAndValidate<const envoy::extensions::clusters::dns::v3::DnsCluster&>(
+            *dns_cluster_msg, factory_context.messageValidationVisitor());
+
+    DnsClusterFactory factory;
+    return factory.createClusterWithConfig(cluster_config, dns_cluster, factory_context);
   }
 
   void expectResolve(Network::DnsLookupFamily dns_lookup_family,
@@ -299,6 +323,9 @@ protected:
   NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
   Common::CallbackHandlePtr priority_update_cb_;
   NiceMock<AccessLog::MockAccessLogManager> access_log_manager_;
+  Extensions::LoadBalancingPolicies::ClusterProvided::Factory cluster_provided_lb_factory_;
+  Registry::InjectFactory<TypedLoadBalancerFactory> cluster_provided_lb_factory_injection_{
+      cluster_provided_lb_factory_};
 };
 
 namespace {
@@ -444,6 +471,211 @@ TEST_P(LogicalDnsImplementationsTest, FailureRefreshRateBackoffResetsWhenSuccess
   ON_CALL(random_, random()).WillByDefault(Return(8000));
   EXPECT_CALL(*resolve_timer_, enableTimer(std::chrono::milliseconds(1000), _));
   dns_callback_(Network::DnsResolver::ResolutionStatus::Failure, "", {});
+}
+
+TEST_F(LogicalDnsClusterTest, OnDemandDnsRequiresClusterProvidedLbPolicy) {
+  const std::string yaml = R"EOF(
+  name: name
+  connect_timeout: 0.25s
+  cluster_type:
+    name: envoy.cluster.dns
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+      on_demand: true
+      dns_lookup_family: V4_ONLY
+      all_addresses_in_single_endpoint: true
+  lb_policy: ROUND_ROBIN
+  load_assignment:
+    endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: foo.bar.com
+                port_value: 443
+  )EOF";
+
+  auto status_or_cluster = createDnsExtensionClusterFromV3Yaml(yaml);
+  EXPECT_FALSE(status_or_cluster.ok());
+  EXPECT_THAT(status_or_cluster.status().message(),
+              testing::HasSubstr("on_demand requires cluster-provided load balancing"));
+}
+
+TEST_F(LogicalDnsClusterTest, OnDemandDnsAcceptsTypedClusterProvidedLoadBalancingPolicy) {
+  const std::string yaml = R"EOF(
+  name: name
+  connect_timeout: 0.25s
+  cluster_type:
+    name: envoy.cluster.dns
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+      on_demand: true
+      dns_lookup_family: V4_ONLY
+      all_addresses_in_single_endpoint: true
+  load_balancing_policy:
+    policies:
+    - typed_extension_config:
+        name: envoy.load_balancing_policies.cluster_provided
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.cluster_provided.v3.ClusterProvided
+  load_assignment:
+    endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: foo.bar.com
+                port_value: 443
+  )EOF";
+
+  resolve_timer_ = new Event::MockTimer(&server_context_.dispatcher_);
+  auto status_or_cluster = createDnsExtensionClusterFromV3Yaml(yaml);
+  ASSERT_TRUE(status_or_cluster.ok()) << status_or_cluster.status();
+}
+
+TEST_F(LogicalDnsClusterTest, OnDemandDnsSkipsWarmupResolveAndResolvesOnFirstUse) {
+  const std::string yaml = R"EOF(
+  name: name
+  connect_timeout: 0.25s
+  cluster_type:
+    name: envoy.cluster.dns
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+      on_demand: true
+      dns_refresh_rate: 5s
+      dns_lookup_family: V4_ONLY
+      all_addresses_in_single_endpoint: true
+  lb_policy: CLUSTER_PROVIDED
+  load_assignment:
+    endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: foo.bar.com
+                port_value: 443
+  )EOF";
+
+  resolve_timer_ = new Event::MockTimer(&server_context_.dispatcher_);
+  EXPECT_CALL(*dns_resolver_, resolve(_, _, _)).Times(0);
+  auto status_or_cluster = createDnsExtensionClusterFromV3Yaml(yaml);
+  ASSERT_TRUE(status_or_cluster.ok()) << status_or_cluster.status();
+
+  cluster_ = std::move(status_or_cluster->first);
+  ASSERT_NE(status_or_cluster->second, nullptr);
+  priority_update_cb_ = cluster_->prioritySet().addPriorityUpdateCb(
+      [&](uint32_t, const HostVector&, const HostVector&) {
+        membership_updated_.ready();
+        return absl::OkStatus();
+      });
+
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  testing::Mock::VerifyAndClearExpectations(dns_resolver_.get());
+  EXPECT_CALL(*dns_resolver_, resolve("foo.bar.com", Network::DnsLookupFamily::V4Only, _))
+      .WillOnce(Invoke([&](const std::string&, Network::DnsLookupFamily,
+                           Network::DnsResolver::ResolveCb cb) -> Network::ActiveDnsQuery* {
+        dns_callback_ = cb;
+        return &active_dns_query_;
+      }));
+
+  auto lb = status_or_cluster->second->factory()->create({cluster_->prioritySet(), nullptr});
+  NiceMock<MockLoadBalancerContext> context;
+  auto host_selection = lb->chooseHost(&context);
+  EXPECT_EQ(host_selection.host, nullptr);
+  ASSERT_NE(host_selection.cancelable, nullptr);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(*resolve_timer_, enableTimer(std::chrono::milliseconds(5000), _));
+  EXPECT_CALL(context, onAsyncHostSelection(_, _))
+      .WillOnce(Invoke([](HostConstSharedPtr&& host, std::string&& details) {
+        ASSERT_NE(host, nullptr);
+        EXPECT_EQ("foo.bar.com", host->hostname());
+        EXPECT_EQ("resolved", details);
+      }));
+  dns_callback_(Network::DnsResolver::ResolutionStatus::Completed, "resolved",
+                TestUtility::makeDnsResponse({"127.0.0.1"}));
+
+  auto resolved_selection = lb->chooseHost(&context);
+  ASSERT_NE(resolved_selection.host, nullptr);
+  EXPECT_EQ("foo.bar.com", resolved_selection.host->hostname());
+  EXPECT_EQ(resolved_selection.cancelable, nullptr);
+}
+
+TEST_F(LogicalDnsClusterTest, StrictOnDemandDnsResolvesMultipleAddressesOnFirstUse) {
+  const std::string yaml = R"EOF(
+  name: name
+  connect_timeout: 0.25s
+  cluster_type:
+    name: envoy.cluster.dns
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.clusters.dns.v3.DnsCluster
+      on_demand: true
+      dns_refresh_rate: 5s
+      dns_lookup_family: V4_ONLY
+  lb_policy: CLUSTER_PROVIDED
+  load_assignment:
+    endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: foo.bar.com
+                port_value: 443
+  )EOF";
+
+  resolve_timer_ = new Event::MockTimer(&server_context_.dispatcher_);
+  EXPECT_CALL(*dns_resolver_, resolve(_, _, _)).Times(0);
+  auto status_or_cluster = createDnsExtensionClusterFromV3Yaml(yaml);
+  ASSERT_TRUE(status_or_cluster.ok()) << status_or_cluster.status();
+
+  cluster_ = std::move(status_or_cluster->first);
+  ASSERT_NE(status_or_cluster->second, nullptr);
+  priority_update_cb_ = cluster_->prioritySet().addPriorityUpdateCb(
+      [&](uint32_t, const HostVector&, const HostVector&) {
+        membership_updated_.ready();
+        return absl::OkStatus();
+      });
+
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  testing::Mock::VerifyAndClearExpectations(dns_resolver_.get());
+  EXPECT_CALL(*dns_resolver_, resolve("foo.bar.com", Network::DnsLookupFamily::V4Only, _))
+      .WillOnce(Invoke([&](const std::string&, Network::DnsLookupFamily,
+                           Network::DnsResolver::ResolveCb cb) -> Network::ActiveDnsQuery* {
+        dns_callback_ = cb;
+        return &active_dns_query_;
+      }));
+
+  auto lb = status_or_cluster->second->factory()->create({cluster_->prioritySet(), nullptr});
+  NiceMock<MockLoadBalancerContext> context;
+  auto host_selection = lb->chooseHost(&context);
+  EXPECT_EQ(host_selection.host, nullptr);
+  ASSERT_NE(host_selection.cancelable, nullptr);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(*resolve_timer_, enableTimer(std::chrono::milliseconds(5000), _));
+  EXPECT_CALL(context, onAsyncHostSelection(_, _))
+      .WillOnce(Invoke([](HostConstSharedPtr&& host, std::string&& details) {
+        ASSERT_NE(host, nullptr);
+        EXPECT_EQ("foo.bar.com", host->hostname());
+        EXPECT_EQ("resolved", details);
+      }));
+  dns_callback_(Network::DnsResolver::ResolutionStatus::Completed, "resolved",
+                TestUtility::makeDnsResponse({"127.0.0.1", "127.0.0.2"}));
+
+  EXPECT_EQ(2UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+  auto resolved_selection = lb->chooseHost(&context);
+  ASSERT_NE(resolved_selection.host, nullptr);
+  EXPECT_EQ("foo.bar.com", resolved_selection.host->hostname());
 }
 
 TEST_P(LogicalDnsImplementationsTest, TtlAsDnsRefreshRate) {

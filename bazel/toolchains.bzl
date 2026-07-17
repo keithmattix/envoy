@@ -20,6 +20,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "{lib_dir}/libclang-cpp.so.{major_minor}",
     "{lib_dir}/libLLVM.so.{major_minor}",
+    "bin/clang-format",
     "lib/clang/{major}/include/fuzzer/FuzzedDataProvider.h",
 ])
 

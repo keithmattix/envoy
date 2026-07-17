@@ -5,6 +5,6 @@ licenses(["notice"])  # Apache 2
 clang_format(
     name = "clang-format",
     # TODO: make this work with toolchain_roots
-    target = "@llvm_toolchain_llvm//:clang-format",
+    target = "@llvm_toolchain_llvm//:bin/clang-format",
     visibility = ["//visibility:public"],
 )

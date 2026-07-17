@@ -21,7 +21,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // Configuration for DNS discovery clusters.
 // [#extension: envoy.clusters.dns]
 
-// [#next-free-field: 11]
+// [#next-free-field: 12]
 message DnsCluster {
   message RefreshRate {
     // Specifies the base interval between refreshes. This parameter is required and must be greater
@@ -97,4 +97,22 @@ message DnsCluster {
   // The value must be at least 1 second.
   google.protobuf.Duration dns_min_refresh_rate = 10
       [(validate.rules).duration = {gte {seconds: 1}}];
+
+  // If true, DNS resolution is started on first use instead of during cluster warming. This can
+  // reduce DNS traffic for clusters that are configured on many Envoy instances but are rarely used.
+  //
+  // When enabled, the cluster must use cluster-provided load balancing, either by setting
+  // :ref:`lb_policy <envoy_v3_api_field_config.cluster.v3.Cluster.lb_policy>` to
+  // ``CLUSTER_PROVIDED`` or by configuring the
+  // :ref:`cluster_provided
+  // <envoy_v3_api_msg_extensions.load_balancing_policies.cluster_provided.v3.ClusterProvided>`
+  // load balancing policy. Standard configured load balancing policies are not used while
+  // on-demand DNS is enabled.
+  //
+  // When enabled, requests to an unresolved cluster require a caller that supports asynchronous host
+  // selection. HTTP routing supports this when
+  // :ref:`envoy.reloadable_features.async_host_selection
+  // <runtime_features>` is enabled; callers that only support synchronous host selection will treat
+  // the unresolved cluster as having no healthy hosts.
+  bool on_demand = 11;
 }

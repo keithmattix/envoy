@@ -25,7 +25,9 @@
 
 def _clang_format_impl(ctx):
     clang_bin = None
-    for file in ctx.attr.target[DefaultInfo].data_runfiles.files.to_list():
+    files = ctx.attr.target[DefaultInfo].files.to_list()
+    files.extend(ctx.attr.target[DefaultInfo].data_runfiles.files.to_list())
+    for file in files:
         if file.basename == "clang-format" and file.dirname.split("/").pop() == "bin":
             clang_bin = file
             break

@@ -16,22 +16,59 @@
 #include "source/extensions/clusters/common/logical_host.h"
 #include "source/extensions/clusters/logical_dns/logical_dns_cluster.h"
 #include "source/extensions/clusters/strict_dns/strict_dns_cluster.h"
+#include "source/extensions/load_balancing_policies/round_robin/round_robin_lb.h"
 
 namespace Envoy {
 namespace Upstream {
+
+namespace {
+
+class OnDemandDnsLoadBalancerFactory : public LoadBalancerFactory {
+public:
+  OnDemandDnsLoadBalancerFactory(std::weak_ptr<DnsClusterImpl> cluster)
+      : cluster_(std::move(cluster)) {}
+
+  // Upstream::LoadBalancerFactory
+  LoadBalancerPtr create(LoadBalancerParams params) override;
+  bool recreateOnHostChangeDeprecated() const override { return false; }
+
+private:
+  std::weak_ptr<DnsClusterImpl> cluster_;
+};
+
+bool usesClusterProvidedLoadBalancing(const envoy::config::cluster::v3::Cluster& cluster) {
+  if (cluster.has_load_balancing_policy()) {
+    const auto& policies = cluster.load_balancing_policy().policies();
+    if (policies.empty()) {
+      return false;
+    }
+    return policies[0].typed_extension_config().name() ==
+           "envoy.load_balancing_policies.cluster_provided";
+  }
+
+  return cluster.lb_policy() == envoy::config::cluster::v3::Cluster::CLUSTER_PROVIDED;
+}
+
+} // namespace
 
 absl::StatusOr<std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr>>
 DnsClusterFactory::createClusterWithConfig(
     const envoy::config::cluster::v3::Cluster& cluster,
     const envoy::extensions::clusters::dns::v3::DnsCluster& proto_config,
     Upstream::ClusterFactoryContext& context) {
+  if (proto_config.on_demand() && !usesClusterProvidedLoadBalancing(cluster)) {
+    return absl::InvalidArgumentError(
+        "DNS cluster on_demand requires cluster-provided load balancing");
+  }
+
   auto dns_resolver_or_error = selectDnsResolver(proto_config.typed_dns_resolver_config(), context);
 
   RETURN_IF_NOT_OK(dns_resolver_or_error.status());
 
   absl::StatusOr<std::unique_ptr<ClusterImplBase>> cluster_or_error;
 
-  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.enable_new_dns_implementation")) {
+  if (proto_config.on_demand() ||
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.enable_new_dns_implementation")) {
     cluster_or_error =
         DnsClusterImpl::create(cluster, proto_config, context, std::move(*dns_resolver_or_error));
   } else if (proto_config.all_addresses_in_single_endpoint()) {
@@ -43,7 +80,13 @@ DnsClusterFactory::createClusterWithConfig(
   }
 
   RETURN_IF_NOT_OK(cluster_or_error.status());
-  return std::make_pair(ClusterImplBaseSharedPtr(std::move(*cluster_or_error)), nullptr);
+  ClusterImplBaseSharedPtr new_cluster(std::move(*cluster_or_error));
+  if (proto_config.on_demand()) {
+    auto dns_cluster = std::static_pointer_cast<DnsClusterImpl>(new_cluster);
+    auto lb = std::make_unique<DnsClusterImpl::ThreadAwareLoadBalancer>(dns_cluster);
+    return std::make_pair(std::move(new_cluster), std::move(lb));
+  }
+  return std::make_pair(std::move(new_cluster), nullptr);
 }
 
 REGISTER_FACTORY(DnsClusterFactory, ClusterFactory);
@@ -134,6 +177,17 @@ DnsClusterImpl::extractAndProcessLoadAssignment(const envoy::config::cluster::v3
  * DnsClusterImpl: implementation for both logical and strict DNS.
  */
 
+class DnsClusterImpl::ThreadLocalState : public ThreadLocal::ThreadLocalObject {
+public:
+  ~ThreadLocalState() override;
+  void add(OnDemandHostSelectionHandle& handle) { pending_handles_.insert(&handle); }
+  void remove(OnDemandHostSelectionHandle& handle) { pending_handles_.erase(&handle); }
+  void onResolveComplete(const std::string& details);
+
+private:
+  absl::flat_hash_set<OnDemandHostSelectionHandle*> pending_handles_;
+};
+
 absl::StatusOr<std::unique_ptr<DnsClusterImpl>>
 DnsClusterImpl::create(const envoy::config::cluster::v3::Cluster& cluster,
                        const envoy::extensions::clusters::dns::v3::DnsCluster& dns_cluster,
@@ -154,7 +208,10 @@ DnsClusterImpl::DnsClusterImpl(const envoy::config::cluster::v3::Cluster& cluste
     : BaseDynamicClusterImpl(cluster, context, creation_status),
       load_assignment_(
           extractAndProcessLoadAssignment(cluster, dns_cluster.all_addresses_in_single_endpoint())),
-      local_info_(context.serverFactoryContext().localInfo()), dns_resolver_(dns_resolver),
+      local_info_(context.serverFactoryContext().localInfo()),
+      main_thread_dispatcher_(context.serverFactoryContext().mainThreadDispatcher()),
+      time_source_(context.serverFactoryContext().timeSource()), dns_resolver_(dns_resolver),
+      tls_slot_(context.serverFactoryContext().threadLocal()),
       dns_refresh_rate_ms_(std::chrono::milliseconds(
           PROTOBUF_GET_MS_OR_DEFAULT(dns_cluster, dns_refresh_rate, 5000))),
       dns_min_refresh_rate_ms_(std::chrono::milliseconds(
@@ -163,10 +220,15 @@ DnsClusterImpl::DnsClusterImpl(const envoy::config::cluster::v3::Cluster& cluste
       respect_dns_ttl_(dns_cluster.respect_dns_ttl()),
       dns_lookup_family_(
           Envoy::DnsUtils::getDnsLookupFamilyFromEnum(dns_cluster.dns_lookup_family())),
-      all_addresses_in_single_endpoint_(dns_cluster.all_addresses_in_single_endpoint()) {
+      all_addresses_in_single_endpoint_(dns_cluster.all_addresses_in_single_endpoint()),
+      on_demand_(dns_cluster.on_demand()) {
   failure_backoff_strategy_ = Config::Utility::prepareDnsRefreshStrategy(
       dns_cluster, dns_refresh_rate_ms_.count(),
       context.serverFactoryContext().api().randomGenerator());
+
+  if (on_demand_) {
+    tls_slot_.set([](Event::Dispatcher&) { return std::make_shared<ThreadLocalState>(); });
+  }
 
   std::list<ResolveTargetPtr> resolve_targets;
   const auto& locality_lb_endpoints = load_assignment_.endpoints();
@@ -215,6 +277,10 @@ DnsClusterImpl::DnsClusterImpl(const envoy::config::cluster::v3::Cluster& cluste
 }
 
 void DnsClusterImpl::startPreInit() {
+  if (on_demand_) {
+    onPreInitComplete();
+    return;
+  }
   for (const ResolveTargetPtr& target : resolve_targets_) {
     target->startResolve();
   }
@@ -223,6 +289,207 @@ void DnsClusterImpl::startPreInit() {
   if (resolve_targets_.empty() || !wait_for_warm_on_init_) {
     onPreInitComplete();
   }
+}
+
+class DnsClusterImpl::LoadBalancer : public Upstream::LoadBalancer {
+public:
+  LoadBalancer(std::weak_ptr<DnsClusterImpl> cluster, LoadBalancerParams params)
+      : cluster_(std::move(cluster)) {
+    auto locked_cluster = cluster_.lock();
+    if (locked_cluster) {
+      envoy::extensions::load_balancing_policies::round_robin::v3::RoundRobin config;
+      lb_ = std::make_unique<RoundRobinLoadBalancer>(
+          params.priority_set, params.local_priority_set, locked_cluster->info()->lbStats(),
+          locked_cluster->runtime_, locked_cluster->random_,
+          PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(locked_cluster->info()->lbConfig(),
+                                                         healthy_panic_threshold, 100, 50),
+          config, locked_cluster->time_source_);
+    }
+  }
+  ~LoadBalancer() override;
+
+  // Upstream::LoadBalancer
+  HostSelectionResponse chooseHost(LoadBalancerContext* context) override;
+  HostConstSharedPtr peekAnotherHost(LoadBalancerContext* context) override {
+    return chooseResolvedHost(context).host;
+  }
+  OptRef<Http::ConnectionPool::ConnectionLifetimeCallbacks> lifetimeCallbacks() override {
+    return std::nullopt;
+  }
+  std::optional<SelectedPoolAndConnection>
+  selectExistingConnection(LoadBalancerContext*, const Host&, std::vector<uint8_t>&) override {
+    return std::nullopt;
+  }
+
+  HostSelectionResponse chooseResolvedHost(LoadBalancerContext*);
+  void add(OnDemandHostSelectionHandle& handle) { pending_host_selection_handles_.insert(&handle); }
+  void remove(OnDemandHostSelectionHandle& handle) {
+    pending_host_selection_handles_.erase(&handle);
+  }
+
+private:
+  std::weak_ptr<DnsClusterImpl> cluster_;
+  LoadBalancerPtr lb_;
+  absl::flat_hash_set<OnDemandHostSelectionHandle*> pending_host_selection_handles_;
+};
+
+class DnsClusterImpl::OnDemandHostSelectionHandle : public AsyncHostSelectionHandle {
+public:
+  OnDemandHostSelectionHandle(LoadBalancerContext& context, LoadBalancer& load_balancer,
+                              ThreadLocalState& thread_local_state)
+      : context_(context), load_balancer_(load_balancer), thread_local_state_(thread_local_state) {
+    thread_local_state_.add(*this);
+    load_balancer_.add(*this);
+  }
+  ~OnDemandHostSelectionHandle() override { cancel(); }
+
+  // Upstream::AsyncHostSelectionHandle
+  void cancel() override {
+    if (registered_) {
+      thread_local_state_.remove(*this);
+      load_balancer_.remove(*this);
+      registered_ = false;
+    }
+  }
+
+  void onResolveComplete(const std::string& details) {
+    if (!registered_) {
+      return;
+    }
+    thread_local_state_.remove(*this);
+    load_balancer_.remove(*this);
+    registered_ = false;
+    auto host_selection = load_balancer_.chooseResolvedHost(&context_);
+    context_.onAsyncHostSelection(std::move(host_selection.host), host_selection.details.empty()
+                                                                      ? std::string(details)
+                                                                      : host_selection.details);
+  }
+
+  void onLoadBalancerDestroyed() {
+    if (!registered_) {
+      return;
+    }
+    thread_local_state_.remove(*this);
+    load_balancer_.remove(*this);
+    registered_ = false;
+    context_.onAsyncHostSelection(nullptr, "load_balancer_destroyed");
+  }
+
+  void onThreadLocalStateDestroyed() {
+    if (!registered_) {
+      return;
+    }
+    load_balancer_.remove(*this);
+    registered_ = false;
+  }
+
+private:
+  LoadBalancerContext& context_;
+  LoadBalancer& load_balancer_;
+  ThreadLocalState& thread_local_state_;
+  bool registered_{true};
+};
+
+DnsClusterImpl::LoadBalancer::~LoadBalancer() {
+  while (!pending_host_selection_handles_.empty()) {
+    (*pending_host_selection_handles_.begin())->onLoadBalancerDestroyed();
+  }
+}
+
+HostSelectionResponse DnsClusterImpl::LoadBalancer::chooseHost(LoadBalancerContext* context) {
+  auto host_selection = chooseResolvedHost(context);
+  if (host_selection.host != nullptr || context == nullptr) {
+    return host_selection;
+  }
+
+  auto cluster = cluster_.lock();
+  if (!cluster) {
+    return {nullptr, "on_demand_dns_cluster_destroyed"};
+  }
+
+  ThreadLocalState& thread_local_state = *cluster->tls_slot_;
+  auto handle = std::make_unique<OnDemandHostSelectionHandle>(*context, *this, thread_local_state);
+  cluster->main_thread_dispatcher_.post([cluster]() { cluster->startOnDemandResolve(); });
+  return {nullptr, std::move(handle)};
+}
+
+HostSelectionResponse
+DnsClusterImpl::LoadBalancer::chooseResolvedHost(LoadBalancerContext* context) {
+  if (lb_ == nullptr) {
+    return {nullptr, "on_demand_dns_cluster_destroyed"};
+  }
+  auto host_selection = lb_->chooseHost(context);
+  if (host_selection.host == nullptr && host_selection.details.empty()) {
+    host_selection.details = "on_demand_dns_not_resolved";
+  }
+  return host_selection;
+}
+
+DnsClusterImpl::ThreadLocalState::~ThreadLocalState() {
+  while (!pending_handles_.empty()) {
+    (*pending_handles_.begin())->onThreadLocalStateDestroyed();
+  }
+}
+
+void DnsClusterImpl::ThreadLocalState::onResolveComplete(const std::string& details) {
+  std::vector<OnDemandHostSelectionHandle*> handles(pending_handles_.begin(),
+                                                    pending_handles_.end());
+  for (auto* handle : handles) {
+    handle->onResolveComplete(details);
+  }
+}
+
+LoadBalancerPtr OnDemandDnsLoadBalancerFactory::create(LoadBalancerParams params) {
+  return std::make_unique<DnsClusterImpl::LoadBalancer>(cluster_, params);
+}
+
+LoadBalancerFactorySharedPtr DnsClusterImpl::ThreadAwareLoadBalancer::factory() {
+  return std::make_shared<OnDemandDnsLoadBalancerFactory>(cluster_);
+}
+
+void DnsClusterImpl::startOnDemandResolve() {
+  ASSERT(main_thread_dispatcher_.isThreadSafe());
+  if (on_demand_resolve_in_progress_) {
+    return;
+  }
+  if (resolve_targets_.empty()) {
+    notifyPendingOnDemandHostSelections("on_demand_dns_no_resolve_targets");
+    return;
+  }
+  on_demand_resolve_in_progress_ = true;
+  pending_on_demand_resolve_targets_ = resolve_targets_.size();
+  on_demand_resolve_details_ = "on_demand_dns_not_resolved";
+  for (const ResolveTargetPtr& target : resolve_targets_) {
+    target->startResolve();
+  }
+}
+
+void DnsClusterImpl::onDemandResolveTargetComplete(std::string details) {
+  if (!on_demand_ || !on_demand_resolve_in_progress_) {
+    return;
+  }
+  if (!details.empty()) {
+    on_demand_resolve_details_ = std::move(details);
+  }
+  ASSERT(pending_on_demand_resolve_targets_ > 0);
+  --pending_on_demand_resolve_targets_;
+  if (pending_on_demand_resolve_targets_ > 0) {
+    return;
+  }
+  on_demand_resolve_in_progress_ = false;
+  notifyPendingOnDemandHostSelections(std::move(on_demand_resolve_details_));
+}
+
+void DnsClusterImpl::notifyPendingOnDemandHostSelections(std::string details) {
+  if (!on_demand_) {
+    return;
+  }
+  tls_slot_.runOnAllThreads([details = std::move(details)](OptRef<ThreadLocalState> local_state) {
+    if (!local_state.has_value()) {
+      return;
+    }
+    local_state->onResolveComplete(details);
+  });
 }
 
 void DnsClusterImpl::updateAllHosts(const HostVector& hosts_added, const HostVector& hosts_removed,
@@ -381,6 +648,9 @@ void DnsClusterImpl::ResolveTarget::updateStrictDnsHosts(const ParsedHosts& new_
 }
 
 void DnsClusterImpl::ResolveTarget::startResolve() {
+  if (active_query_ != nullptr) {
+    return;
+  }
   ENVOY_LOG(trace, "starting async DNS resolution for {}", dns_address_);
   parent_.info_->configUpdateStats().update_attempt_.inc();
 
@@ -408,6 +678,8 @@ void DnsClusterImpl::ResolveTarget::startResolve() {
             ENVOY_LOG(error, "Failed to process DNS response for {} with error: {}", dns_address_,
                       new_hosts_or_error.status().message());
             parent_.info_->configUpdateStats().update_failure_.inc();
+            parent_.onDemandResolveTargetComplete(
+                std::string(new_hosts_or_error.status().message()));
             return;
           }
 
@@ -457,6 +729,7 @@ void DnsClusterImpl::ResolveTarget::startResolve() {
         // complexity is needed so will start with this.
         parent_.onPreInitComplete();
         resolve_timer_->enableTimer(final_refresh_rate);
+        parent_.onDemandResolveTargetComplete(std::string(details));
       });
 }
 
